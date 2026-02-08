@@ -1,0 +1,11 @@
+#!/bin/bash
+
+VM_NAME="Win11"
+
+# Start VM only if it's not already running
+if VBoxManage list runningvms | grep -q "\"$VM_NAME\""; then
+    echo "Windows VM is already running."
+else
+    VBoxManage startvm "$VM_NAME" --type gui
+fi
+

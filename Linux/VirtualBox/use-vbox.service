@@ -1,0 +1,14 @@
+[Unit]
+Description=Disable KVM so VirtualBox can run (stop WinApps + unload kvm modules)
+After=network-online.target
+Wants=network-online.target
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/use-vbox
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
