@@ -1,7 +1,5 @@
 # Custom Tools Installation
 
-Run `sudo ./install.sh` to install all tools on a new system.
-
 ## Files
 
 | File | Install Location | Description |
