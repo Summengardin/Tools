@@ -18,7 +18,7 @@ set -euo pipefail
 #   - writes SSH config host entries,
 #   - manages a "CURRENT-PROJECT" block in ~/.ssh/config that rewrites bare aliases.
 
-SCRIPT_VERSION="4.1"
+SCRIPT_VERSION="4.2"
 
 # Storage
 REG_DIR="$HOME/.ssh/controller_registry"
@@ -192,6 +192,17 @@ known_hosts_file_for() {
   local host_alias="$1"
   echo "$KNOWN_HOSTS_DIR/$(sanitize_token "$host_alias")"
 }
+
+remove_stale_hostkey() {
+  local ip="$1"
+
+  if [[ -n "$ip" ]]; then
+    log "Removing stale SSH host key for $ip (if any)"
+    ssh-keygen -R "$ip" >/dev/null 2>&1 || true
+    ssh-keygen -R "[$ip]:22" >/dev/null 2>&1 || true
+  fi
+}
+
 
 # ---------- metadata ----------
 
@@ -616,6 +627,8 @@ pair_controller() {
     "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
 
   if [[ $already_paired -eq 0 ]]; then
+    log "Removing stale SSH host key (if any)..."
+    remove_stale_hostkey "$ip"
     log "Installing SSH key..."
     if command -v ssh-copy-id >/dev/null 2>&1; then
       if [[ -n "$PASSWORD" || $ASK_PASSWORD -eq 1 ]]; then
