@@ -1,12 +1,3 @@
-# Ensure remote ~/.ssh exists (password auth bootstrap)
-log "Preparing remote ~/.ssh (password auth)..."
-if [[ -n "$PASSWORD" || $ASK_PASSWORD -eq 1 ]]; then
-  ensure_password "$ssh_target"
-  run_cmd env SSHPASS="$PASSWORD" sshpass -e ssh       -o PreferredAuthentications=password       -o PubkeyAuthentication=no       -o PasswordAuthentication=yes       -o ConnectTimeout=10       "${ssh_opts_common[@]}"       "$ssh_target"       "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-else
-  run_cmd ssh       -o PreferredAuthentications=password       -o PubkeyAuthentication=no       -o PasswordAuthentication=yes       -o ConnectTimeout=10       "${ssh_opts_common[@]}"       "$ssh_target"       "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-fi
-
 #!/usr/bin/env bash
 set -euo pipefail
 
