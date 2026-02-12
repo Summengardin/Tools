@@ -1,236 +1,156 @@
-# Quick Reference: Common Scenarios
+# pair-controller.sh (v4)
 
-## Recommended Workflow: Use Current Project Feature
+This tool pairs SSH access to controllers and manages convenient SSH host aliases.
 
-**Best practice for multiple sites with the same IP:**
+## Concepts
+
+- **Controller alias (ALIAS)**: a human name for a controller role/device  
+  Examples: `GWA`, `GWB`, `Lift`
+
+- **Project id (PROJECT)**: the project identifier  
+  Example: `102156`
+
+- **Stable SSH host alias**:  
+  `ALIAS-PROJECT[-CONTROLLER_ID]`  
+  Examples:
+  - `GWA-102156`
+  - `GWB-102156`
+  - `Lift-102156`
+  - `GWA-102156-spare` (only if you use `--controller spare`)
+
+- **Current project**: when set, bare aliases resolve within that project:
+  - `ssh GWA` connects to `GWA-<current_project>`
+  - `ssh GWB` connects to `GWB-<current_project>`
+  - `ssh Lift` connects to `Lift-<current_project>`
+
+## Install prerequisites
+
+- `ssh`, `ssh-copy-id` (optional but recommended)
+- `jq` (required)
+- A local SSH keypair (recommended: ed25519)
+
+Generate a key if needed:
 
 ```bash
-# ONE-TIME SETUP: Pair all your sites
-./pair-controller.sh --unique-id site-a 192.168.1.50 root
-./pair-controller.sh --unique-id site-b 192.168.1.50 root
-./pair-controller.sh --unique-id site-c 192.168.1.50 root
+ssh-keygen -t ed25519
+```
 
-# Set which one is active
-./pair-controller.sh --set-current site-a-50
+## Pair controllers into a project
 
-# Now you can ALWAYS use the same command:
-ssh GWB  # Connects to Site A
+Register each controller with its ALIAS and IP/host:
 
-# When you move to Site B, just switch:
-./pair-controller.sh --set-current site-b-50
-ssh GWB  # Now connects to Site B
+```bash
+./pair-controller.sh --project 102156 --alias GWA 10.1.2.1 root
+./pair-controller.sh --project 102156 --alias GWB 10.2.1.3 root
+./pair-controller.sh --project 102156 --alias Lift 10.5.6.3 root
+```
 
-# Check which is active anytime:
-./pair-controller.sh --show-current
+This creates SSH hosts:
 
-# List all and see which is current (marked with ★):
+- `GWA-102156`
+- `GWB-102156`
+- `Lift-102156`
+
+Connect:
+
+```bash
+ssh GWA-102156
+```
+
+## Set current project (drop the suffix)
+
+```bash
+./pair-controller.sh --set-current-project 102156
+```
+
+Now you can:
+
+```bash
+ssh GWA
+ssh GWB
+ssh Lift
+```
+
+Under the hood, the script writes a managed block into `~/.ssh/config`:
+
+- `Host GWA` points to the IP/user/key for `GWA-102156`
+- `Host GWB` points to `GWB-102156`
+- `Host Lift` points to `Lift-102156`
+
+When you change the current project, that block is rewritten.
+
+## Temporarily jump to another project
+
+Even if your current project is `102156`, you can connect to another project's controller without switching:
+
+```bash
+ssh GWA-204400
+```
+
+## List, info, delete
+
+List everything:
+
+```bash
 ./pair-controller.sh --list
 ```
 
-**Benefits:**
-- ✅ Always use `ssh GWB` - muscle memory!
-- ✅ No re-pairing needed when switching sites
-- ✅ All controllers stay registered
-- ✅ Quick one-command switching
-- ✅ Can still use specific aliases: `ssh site-a-50`, `ssh site-b-50`
-
----
-
-## Scenario 1: Multiple Controllers, Same IP, Different Projects
-
-**Problem**: You work on different projects with GWB controllers that all use 192.168.1.50
-
-**Solution**: Use unique-id to distinguish them
+Show details:
 
 ```bash
-# Project Alpha
-./pair-controller.sh --unique-id alpha 192.168.1.50 root
-# Connect: ssh alpha-50
-
-# Project Beta  
-./pair-controller.sh --unique-id beta 192.168.1.50 root
-# Connect: ssh beta-50
-
-# Project Gamma
-./pair-controller.sh --unique-id gamma 192.168.1.50 root
-# Connect: ssh gamma-50
+./pair-controller.sh --info GWA-102156
 ```
 
-## Scenario 2: Your SSH Key Was Removed
-
-**Problem**: Controller admin reset the system or removed your key
-
-**Solution**: Use repair to quickly re-pair
+Delete a registration:
 
 ```bash
-# List your controllers to find the alias
-./pair-controller.sh --list
-
-# Re-pair without re-entering all parameters
-./pair-controller.sh --repair alpha-50
-
-# Or if you lost the alias name, check info first
-./pair-controller.sh --info alpha-50
-./pair-controller.sh --repair alpha-50
+./pair-controller.sh --delete GWA-102156
 ```
 
-## Scenario 3: Same Controller, Different Locations
+## Repair / re-pair
 
-**Problem**: You move a GWB controller between buildings (same physical device, different networks)
-
-**Solution**: Use unique-id based on location, not the device
+If keys or SSH config got out of sync, re-pair a host alias:
 
 ```bash
-# Controller in Building A
-./pair-controller.sh --unique-id bldg-a 192.168.1.50 root
-# Connect: ssh bldg-a-50
-
-# Later, same controller moved to Building B
-./pair-controller.sh --unique-id bldg-b 192.168.1.50 root
-# Connect: ssh bldg-b-50
-
-# You now have both in history
-./pair-controller.sh --list
+./pair-controller.sh --repair GWA-102156
 ```
 
-## Scenario 4: Switching Your SSH Key
+This forces key installation and rewrites the matching `Host GWA-102156` block.
 
-**Problem**: You generated a new SSH key and want to update the controller
+## Strict vs permissive host key checking
 
-**Solution**: Re-pair with new key path
+Default is permissive:
+
+- `StrictHostKeyChecking no`
+- Per-host `UserKnownHostsFile` to avoid cross-project collisions when IPs are reused.
+
+Enable stricter behavior:
 
 ```bash
-# Generate new key
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_new
-
-# Re-pair with explicit new key
-./pair-controller.sh 192.168.1.50 root alpha-50 ~/.ssh/id_ed25519_new.pub
-
-# Or use repair if it's already your default key
-./pair-controller.sh --repair alpha-50
+./pair-controller.sh --strict --project 102156 --alias GWA 10.1.2.1 root
 ```
 
-## Scenario 5: Quick Status Check
+This uses:
 
-**Problem**: Not sure which controllers you have registered or if they're reachable
+- `StrictHostKeyChecking accept-new`
 
-**Solution**: Use list and info commands
+## Notes on duplicates
+
+If you ever need multiple controllers with the same ALIAS in a project, use `--controller` to create distinct stable hosts:
 
 ```bash
-# See all registered controllers
-./pair-controller.sh --list
-
-# Check if specific controller is reachable
-./pair-controller.sh --info alpha-50
-# Output shows connection test result
-
-# Try connecting
-ssh alpha-50
+./pair-controller.sh --project 102156 --alias GWA --controller spare 10.1.2.99 root
 ```
 
-## Scenario 6: Clean Up Old Controllers
+Stable host becomes:
 
-**Problem**: You finished a project and want to remove the controller entry
+- `GWA-102156-spare`
 
-**Solution**: Use delete command
+Bare alias resolution (`ssh GWA`) will choose the first `GWA*` entry it finds for that project. In practice you said duplicates won't be relevant; if you do hit this, use the stable alias (`ssh GWA-102156-spare`) and/or adjust registrations.
 
-```bash
-# Remove controller registration
-./pair-controller.sh --delete alpha-50
+## Compatibility
 
-# This removes:
-# - Metadata file
-# - Known hosts file  
-# - SSH config entry
-```
+Older versions used `--unique-id` and `--set-current`. v4 keeps them as deprecated shims:
 
-## Common Commands Cheat Sheet
-
-```bash
-# Pair new controller
-./pair-controller.sh <IP> <user>
-
-# Pair with unique ID
-./pair-controller.sh --unique-id <id> <IP> <user>
-
-# Pair with custom alias
-./pair-controller.sh <IP> <user> <alias>
-
-# Pair with specific key
-./pair-controller.sh <IP> <user> <alias> <pubkey_path>
-
-# Re-pair existing controller
-./pair-controller.sh --repair <alias>
-
-# Set as current (creates GWB alias)
-./pair-controller.sh --set-current <alias>
-
-# Show current active controller
-./pair-controller.sh --show-current
-
-# List all controllers
-./pair-controller.sh --list
-
-# Get controller info
-./pair-controller.sh --info <alias>
-
-# Delete controller
-./pair-controller.sh --delete <alias>
-
-# Verbose output (for debugging)
-./pair-controller.sh -v <IP> <user>
-
-# Dry run (see what would happen)
-./pair-controller.sh -n <IP> <user>
-```
-
-## Workflow Example: Typical Day
-
-```bash
-# Monday: Start new project "Phoenix" - ONE TIME SETUP
-./pair-controller.sh --unique-id phoenix 192.168.1.50 root
-./pair-controller.sh --set-current phoenix-50
-ssh GWB  # Test connection
-
-# Tuesday: Someone reset the controller
-./pair-controller.sh --repair phoenix-50  # Quick fix!
-ssh GWB  # Back in business
-
-# Wednesday: Switch to project "Orion" (same IP, different controller)
-./pair-controller.sh --unique-id orion 192.168.1.50 root  # ONE TIME
-./pair-controller.sh --set-current orion-50  # Switch to it
-ssh GWB  # Different controller, same command!
-
-# Thursday: Need to check Phoenix again
-./pair-controller.sh --set-current phoenix-50  # Just switch back
-ssh GWB  # Now on Phoenix again
-
-# Friday: Check what you have
-./pair-controller.sh --list  # Shows both, ★ marks current
-./pair-controller.sh --show-current  # Shows Phoenix is active
-
-# Project Phoenix complete - clean up
-./pair-controller.sh --delete phoenix-50
-```
-
-## Troubleshooting
-
-### "Cannot reach IP:22"
-- Check network connectivity
-- Verify controller is powered on
-- Confirm IP address is correct
-- Try: `ping 192.168.1.50`
-
-### "Public key not found"
-- Generate new key: `ssh-keygen -t ed25519`
-- Or specify key: `./pair-controller.sh <IP> <user> <alias> ~/.ssh/your_key.pub`
-
-### "Password authentication failed"
-- Install sshpass: `sudo apt install sshpass`
-- Use: `SSH_PASSWORD='yourpass' ./pair-controller.sh <IP> <user>`
-- Or enter password when prompted
-
-### "Controller already registered"
-- View info: `./pair-controller.sh --info <alias>`
-- Delete and re-pair: `./pair-controller.sh --delete <alias>`
-- Or force overwrite by confirming when prompted
+- `--unique-id` is treated as `--project`
+- `--set-current <HOSTALIAS>` sets current project to that host's project

@@ -1,131 +1,133 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Configuration
-SCRIPT_VERSION="2.1"
-CONTROLLER_DB="$HOME/.ssh/controller_registry"
+# pair-controller.sh
+# Version 4.0
+#
+# Model:
+#   - Controllers are named by an ALIAS (e.g., GWA, GWB, Lift).
+#   - Controllers belong to a PROJECT (e.g., 102156).
+#   - The stable SSH host entries are:  <ALIAS>-<PROJECT>[-<CONTROLLER_ID>]
+#       Examples: GWA-102156, GWB-102156, Lift-102156, GWA-102156-spare
+#   - You can set a CURRENT PROJECT. Then bare aliases resolve within that project:
+#       ssh GWA  (=> connects to GWA-<current_project>)
+#
+# This script:
+#   - installs your SSH public key onto the controller (password auth once),
+#   - registers metadata per host alias,
+#   - writes SSH config host entries,
+#   - manages a "CURRENT-PROJECT" block in ~/.ssh/config that rewrites bare aliases.
+
+SCRIPT_VERSION="4.0"
+
+# Storage
+REG_DIR="$HOME/.ssh/controller_registry"
 KNOWN_HOSTS_DIR="$HOME/.ssh/known_hosts_controllers"
-PASSWORD_DIR="$HOME/.ssh/controller_passwords"
-CURRENT_CONTROLLER_FILE="$HOME/.ssh/controller_registry/.current"
+PROJECT_DB="$REG_DIR/projects"
+CURRENT_PROJECT_FILE="$REG_DIR/.current_project"
+
+# Managed block markers for ~/.ssh/config
+CURRENT_BLOCK_BEGIN="# BEGIN pair-controller CURRENT-PROJECT"
+CURRENT_BLOCK_END="# END pair-controller CURRENT-PROJECT"
+
+# Runtime flags
 VERBOSE=0
 DRY_RUN=0
 STRICT_MODE=0
+FORCE_REPAIR=0
 
-# Colors for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Utilities
-die() { 
-  echo -e "${RED}ERROR: $*${NC}" >&2
-  exit 1
-}
-
-log() { 
-  echo -e "${GREEN}==>${NC} $*"
-}
-
-warn() {
-  echo -e "${YELLOW}WARNING: $*${NC}" >&2
-}
-
-debug() { 
-  [[ $VERBOSE -eq 1 ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2 || true
-}
-
-info() {
-  echo -e "${BLUE}[INFO]${NC} $*"
-}
+die() { echo -e "${RED}ERROR:${NC} $*" >&2; exit 1; }
+log() { echo -e "${GREEN}==>${NC} $*"; }
+warn(){ echo -e "${YELLOW}WARNING:${NC} $*" >&2; }
+info(){ echo -e "${BLUE}[INFO]${NC} $*"; }
+debug(){ [[ $VERBOSE -eq 1 ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2 || true; }
 
 usage() {
   cat <<'EOF'
 Usage:
-  pair-controller.sh [OPTIONS] <controller_ip> <user> [host_alias] [pubkey_path]
+  pair-controller.sh [OPTIONS] <controller_ip_or_host> <user> [pubkey_path]
+
+Core model:
+  - Controllers are identified by an ALIAS (e.g., GWA, GWB, Lift).
+  - Controllers belong to a PROJECT (e.g., 102156).
+  - Stable SSH hosts are: <ALIAS>-<PROJECT>[-<CONTROLLER_ID>]
+  - If you set a current project, bare aliases resolve within that project:
+      ssh GWA   -> connects to GWA-<current_project>
+
+Pairing:
+  ./pair-controller.sh --project 102156 --alias GWA 10.1.2.1 root
+  ./pair-controller.sh --project 102156 --alias GWB 10.2.1.3 root
+  ./pair-controller.sh --project 102156 --alias Lift 10.5.6.3 root
+
+Workflow:
+  ./pair-controller.sh --set-current-project 102156
+  ssh GWA
+  ssh GWB
+  ssh Lift
+
+Temporary jump (without switching current project):
+  ssh GWA-204400
 
 Options:
-  -v, --verbose             Enable verbose output
-  -n, --dry-run             Show what would be done without doing it
-  -s, --strict              Use strict host key checking (accept-new instead of no)
-  -r, --repair ALIAS        Re-pair to an existing controller (force key reinstallation)
-  -l, --list                List all registered controllers
-  -d, --delete ALIAS        Remove a controller registration
-  -i, --info ALIAS          Show detailed info about a controller
-  -u, --unique-id ID        Unique identifier for this controller (project, location, serial)
-  -c, --set-current ALIAS   Set a project as current (creates alias pointing to it)
-  --show-current            Show which controller is currently active
-  -h, --help                Show this help message
+  -v, --verbose                    Verbose output
+  -n, --dry-run                    Show what would be done without doing it
+  -s, --strict                     Strict host key checking (accept-new instead of no)
 
-Examples:
-  # Basic pairing (default: no host key checking, per-controller tracking)
-  ./pair-controller.sh 192.168.1.50 root
+Identity:
+  -p, --project PROJECT            Project identifier (required for pairing)
+  -a, --alias ALIAS                Controller alias base (required for pairing, e.g. GWA, GWB, Lift)
+  --controller ID                  Optional controller identifier (only for duplicates, e.g. spare)
 
-  # With custom alias
-  ./pair-controller.sh 192.168.1.50 admin controller-main
+Registry:
+  -l, --list                       List registered controllers
+  -i, --info HOSTALIAS             Show info for a specific host alias (e.g., GWA-102156)
+  -d, --delete HOSTALIAS           Delete registration + host config entry for that alias
+  -r, --repair HOSTALIAS           Re-pair to an existing host alias (force key installation)
 
-  # With specific public key
-  ./pair-controller.sh 192.168.1.50 admin controller-main ~/.ssh/id_ed25519.pub
+Current project:
+  --set-current-project PROJECT    Set current project (rewrites bare alias hosts)
+  --show-current-project           Show current project and available bare aliases
 
-  # Multiple controllers with same IP - using unique identifier
-  ./pair-controller.sh --unique-id project-alpha 192.168.1.50 root
-  ./pair-controller.sh --unique-id project-beta 192.168.1.50 root
-  ./pair-controller.sh --unique-id building-5 192.168.1.50 admin
-  
-  # Combine unique-id with custom alias
-  ./pair-controller.sh --unique-id alpha 192.168.1.50 root gwb-main
+Compatibility (older versions):
+  --unique-id ID                   Treated as --project ID (deprecated)
+  --set-current HOSTALIAS          Sets current project to HOSTALIAS's project (deprecated)
 
-  # Strict mode (for production controllers with stable keys)
-  ./pair-controller.sh --strict 192.168.1.50 root controller-prod
-
-  # Using password from environment (with sshpass)
-  SSH_PASSWORD='yourpass' ./pair-controller.sh 192.168.1.50 admin
-
-  # Verbose mode
-  ./pair-controller.sh -v 192.168.1.50 root
-
-  # List all registered controllers
-  ./pair-controller.sh --list
-
-  # Show info about a controller
-  ./pair-controller.sh --info controller-50
-
-  # Re-pair to existing controller (force key reinstallation)
-  ./pair-controller.sh --repair alpha-50
-
-  # Set current active controller (creates 'GWB' alias)
-  ./pair-controller.sh --set-current site-a-50
-  
-  # Check which controller is active
-  ./pair-controller.sh --show-current
-
-  # Remove a controller
-  ./pair-controller.sh --delete controller-50
-
-Notes:
-  - Default behavior uses StrictHostKeyChecking=no (for dev workflow with same IP,
-    different physical controllers)
-  - Each controller gets its own known_hosts file and metadata
-  - Use --unique-id to distinguish between different physical controllers sharing an IP
-  - The unique-id is incorporated into the alias (e.g., gwb-alpha-50 for IP .50)
-  - Use --set-current to create a 'GWB' alias that points to your active controller
-  - Switch between sites easily: just --set-current to the other controller
-  - Use --repair to re-install SSH key on a controller (e.g., if key was removed)
-  - Use --strict for production controllers where host keys shouldn't change
-  - If sshpass is installed and SSH_PASSWORD is set, password auth will be non-interactive
 EOF
 }
 
-# Validate IPv4 address
+# ---------- helpers ----------
+
+setup_directories() {
+  mkdir -p "$REG_DIR" "$KNOWN_HOSTS_DIR" "$PROJECT_DB" "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh" "$REG_DIR" "$KNOWN_HOSTS_DIR" "$PROJECT_DB"
+}
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required. Install with: sudo apt install jq"
+}
+
+run_cmd() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "+ $*"
+    return 0
+  fi
+  "$@"
+}
+
+# Validate IPv4 address (best-effort; hostnames/IPv6 are allowed)
 validate_ipv4() {
   local ip=$1
   local IFS='.'
   local -a octets
   read -ra octets <<< "$ip"
-  
   [[ ${#octets[@]} -eq 4 ]] || return 1
-  
   for octet in "${octets[@]}"; do
     [[ "$octet" =~ ^[0-9]+$ ]] || return 1
     ((octet >= 0 && octet <= 255)) || return 1
@@ -133,303 +135,142 @@ validate_ipv4() {
   return 0
 }
 
-# Test network connectivity
 test_connection() {
-  local ip=$1
+  local host=$1
   local port=${2:-22}
-  local timeout=${3:-5}
-  
-  debug "Testing connection to ${ip}:${port} with timeout ${timeout}s"
-  
-  if timeout "$timeout" bash -c "cat < /dev/null > /dev/tcp/${ip}/${port}" 2>/dev/null; then
+  local timeout_s=${3:-5}
+  debug "Testing connectivity to ${host}:${port} ..."
+  if timeout "$timeout_s" bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" 2>/dev/null; then
     return 0
-  else
-    return 1
   fi
+  return 1
 }
 
-# Setup directories
-setup_directories() {
-  mkdir -p "$CONTROLLER_DB"
-  mkdir -p "$KNOWN_HOSTS_DIR"
-  mkdir -p "$PASSWORD_DIR"
-  mkdir -p "$HOME/.ssh"
-  chmod 700 "$HOME/.ssh"
-  chmod 700 "$CONTROLLER_DB"
-  chmod 700 "$KNOWN_HOSTS_DIR"
-  chmod 700 "$PASSWORD_DIR"
+sanitize_token() {
+  # SSH Host patterns are flexible, but keep registry filenames safe/predictable.
+  local s=$1
+  s="${s//[^a-zA-Z0-9-]/-}"
+  echo "${s:0:40}"
 }
 
-# List all registered controllers
-list_controllers() {
-  if [[ ! -d "$CONTROLLER_DB" ]] || [[ -z "$(ls -A "$CONTROLLER_DB" 2>/dev/null)" ]]; then
-    info "No controllers registered yet."
-    exit 0
-  fi
-
-  # Get current controller if set
-  local current_alias=""
-  if [[ -f "$CURRENT_CONTROLLER_FILE" ]]; then
-    current_alias=$(<"$CURRENT_CONTROLLER_FILE")
-  fi
-
-  echo ""
-  echo "Registered Controllers:"
-  echo "======================"
-  
-  for file in "$CONTROLLER_DB"/*.json; do
-    [[ -f "$file" ]] || continue
-    
-    # Skip the .current file
-    [[ "$file" == *"/.current" ]] && continue
-    
-    if command -v jq >/dev/null 2>&1; then
-      local alias=$(jq -r '.alias' "$file")
-      local ip=$(jq -r '.ip' "$file")
-      local user=$(jq -r '.user' "$file")
-      local hostname=$(jq -r '.hostname // "unknown"' "$file")
-      local unique_id=$(jq -r '.unique_id // "none"' "$file")
-      local paired_date=$(jq -r '.paired_date' "$file")
-      
-      echo ""
-      # Mark current controller
-      if [[ "$alias" == "$current_alias" ]]; then
-        echo -e "  ${GREEN}★ CURRENT${NC}"
-      fi
-      echo "  Alias:     $alias"
-      echo "  IP:        $ip"
-      echo "  User:      $user"
-      echo "  Unique ID: $unique_id"
-      echo "  Hostname:  $hostname"
-      echo "  Paired:    $paired_date"
-      echo "  Connect:   ssh $alias"
-      if [[ "$alias" == "$current_alias" ]]; then
-        echo -e "             ${GREEN}ssh GWB${NC} (active)"
-      fi
-    else
-      echo "  ${file##*/} (install jq for detailed info)"
-    fi
+find_default_pubkey() {
+  local candidates=("$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub" "$HOME/.ssh/id_rsa.pub")
+  for c in "${candidates[@]}"; do
+    [[ -f "$c" ]] && { echo "$c"; return 0; }
   done
-  echo ""
-  
-  if [[ -z "$current_alias" ]]; then
-    echo "No current controller set. Use: ./pair-controller.sh --set-current <alias>"
-    echo ""
-  fi
+  return 1
 }
 
-# Show detailed info about a controller
-show_controller_info() {
-  local alias=$1
-  local metadata_file="${CONTROLLER_DB}/${alias}.json"
-  
-  if [[ ! -f "$metadata_file" ]]; then
-    die "Controller '${alias}' not found in registry"
-  fi
-  
-  echo ""
-  echo "Controller Information: ${alias}"
-  echo "========================================"
-  
-  if command -v jq >/dev/null 2>&1; then
-    jq -r 'to_entries | .[] | "  \(.key | ascii_upcase): \(.value)"' "$metadata_file"
-  else
-    cat "$metadata_file"
-  fi
-  
-  echo ""
-  
-  # Check if we can connect
-  local ip=$(jq -r '.ip' "$metadata_file" 2>/dev/null || echo "unknown")
-  if [[ "$ip" != "unknown" ]]; then
-    echo "Testing connection..."
-    if test_connection "$ip" 22 3; then
-      echo -e "  ${GREEN}✓${NC} Port 22 is reachable"
-    else
-      echo -e "  ${RED}✗${NC} Port 22 is NOT reachable"
-    fi
-  fi
-  echo ""
+project_metadata_file() {
+  local project_id="$1"
+  echo "$PROJECT_DB/$(sanitize_token "$project_id").json"
 }
 
-# Delete a controller registration
-delete_controller() {
-  local alias=$1
-  local metadata_file="${CONTROLLER_DB}/${alias}.json"
-  local known_hosts_file="${KNOWN_HOSTS_DIR}/${alias}"
-  local ssh_config="$HOME/.ssh/config"
-  
-  if [[ ! -f "$metadata_file" ]]; then
-    die "Controller '${alias}' not found in registry"
-  fi
-  
-  warn "This will remove:"
-  echo "  - Metadata: ${metadata_file}"
-  echo "  - Known hosts: ${known_hosts_file}"
-  echo "  - SSH config entry for: ${alias}"
-  echo ""
-  
-  read -p "Are you sure you want to delete '${alias}'? (y/N) " -n 1 -r
-  echo
-  
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Cancelled."
-    exit 0
-  fi
-  
-  # Remove metadata
-  [[ -f "$metadata_file" ]] && rm -f "$metadata_file" && log "Removed metadata"
-  
-  # Remove known_hosts
-  [[ -f "$known_hosts_file" ]] && rm -f "$known_hosts_file" && log "Removed known_hosts"
-  
-  # Remove from SSH config
-  if [[ -f "$ssh_config" ]]; then
-    local tmpfile=$(mktemp)
-    awk -v alias="$alias" '
-      /^Host[[:space:]]+/ {
-        in_target = ($0 ~ "^Host[[:space:]]+" alias "([[:space:]]|$)")
-        if (!in_target) print
-        next
-      }
-      /^Match[[:space:]]+/ {
-        in_target = 0
-        print
-        next
-      }
-      /^[^[:space:]]/ && in_target {
-        in_target = 0
-      }
-      !in_target {
-        print
-      }
-    ' "$ssh_config" > "$tmpfile"
-    mv "$tmpfile" "$ssh_config"
-    log "Removed SSH config entry"
-  fi
-  
-  log "Controller '${alias}' deleted successfully"
+host_metadata_file() {
+  local host_alias="$1"
+  echo "$REG_DIR/$(sanitize_token "$host_alias").json"
 }
 
-# Re-pair to an existing controller (force key reinstallation)
-repair_controller() {
-  local alias=$1
-  local metadata_file="${CONTROLLER_DB}/${alias}.json"
-  
-  if [[ ! -f "$metadata_file" ]]; then
-    die "Controller '${alias}' not found in registry.\nUse './pair-controller.sh --list' to see registered controllers."
-  fi
-  
-  # Load existing metadata
-  if ! command -v jq >/dev/null 2>&1; then
-    die "jq is required for repair functionality. Install with: sudo apt install jq"
-  fi
-  
-  local ip=$(jq -r '.ip' "$metadata_file")
-  local user=$(jq -r '.user' "$metadata_file")
-  local pubkey_path=$(jq -r '.pubkey_path' "$metadata_file")
-  local unique_id=$(jq -r '.unique_id // ""' "$metadata_file")
-  
-  info "Re-pairing to controller: ${alias}"
-  echo "  IP:        $ip"
-  echo "  User:      $user"
-  echo "  Pubkey:    $pubkey_path"
-  [[ -n "$unique_id" ]] && echo "  Unique ID: $unique_id"
-  echo ""
-  
-  # Verify pubkey still exists
-  if [[ ! -f "$pubkey_path" ]]; then
-    warn "Original public key not found: ${pubkey_path}"
-    read -p "Use default public key instead? (y/N) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-      if ! pubkey_path=$(find_default_pubkey); then
-        die "No default public key found. Generate one with: ssh-keygen -t ed25519"
-      fi
-      info "Using default public key: ${pubkey_path}"
-    else
-      die "Cannot proceed without a public key"
-    fi
-  fi
-  
-  # Force re-pair by calling pair_controller with force flag
-  info "Forcing key reinstallation..."
-  FORCE_REPAIR=1 pair_controller "$ip" "$user" "$alias" "$pubkey_path" "$unique_id"
+known_hosts_file_for() {
+  local host_alias="$1"
+  echo "$KNOWN_HOSTS_DIR/$(sanitize_token "$host_alias")"
 }
 
-# Set current active controller (creates GWB alias)
-set_current_controller() {
-  local alias=$1
-  local metadata_file="${CONTROLLER_DB}/${alias}.json"
-  
-  if [[ ! -f "$metadata_file" ]]; then
-    die "Controller '${alias}' not found in registry.\nUse './pair-controller.sh --list' to see registered controllers."
-  fi
-  
-  # Load controller metadata
-  if ! command -v jq >/dev/null 2>&1; then
-    die "jq is required for this feature. Install with: sudo apt install jq"
-  fi
-  
-  local ip=$(jq -r '.ip' "$metadata_file")
-  local user=$(jq -r '.user' "$metadata_file")
-  local hostname=$(jq -r '.hostname // "unknown"' "$metadata_file")
-  local unique_id=$(jq -r '.unique_id // "none"' "$metadata_file")
-  local pubkey_path=$(jq -r '.pubkey_path' "$metadata_file")
-  local identity_file="${pubkey_path%.pub}"
-  local known_hosts_file="${KNOWN_HOSTS_DIR}/${alias}"
-  
-  info "Setting '${alias}' as current active controller"
-  echo "  IP:        $ip"
-  echo "  User:      $user"
-  echo "  Hostname:  $hostname"
-  echo "  Unique ID: $unique_id"
-  echo ""
-  
-  # Update SSH config with GWB alias
-  local ssh_config="$HOME/.ssh/config"
+# ---------- metadata ----------
+
+store_host_metadata() {
+  require_jq
+  local host_alias="$1" ip="$2" user="$3" pubkey_path="$4" hostname="$5" project_id="$6" alias_base="$7" controller_id="$8"
+
+  local f; f=$(host_metadata_file "$host_alias")
+  local now; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local json
+  json="$(jq -n \
+    --arg alias "$host_alias" \
+    --arg ip "$ip" \
+    --arg user "$user" \
+    --arg pubkey_path "$pubkey_path" \
+    --arg hostname "$hostname" \
+    --arg project_id "$project_id" \
+    --arg alias_base "$alias_base" \
+    --arg controller_id "${controller_id:-}" \
+    --arg paired_date "$now" \
+    '{
+      alias: $alias,
+      ip: $ip,
+      user: $user,
+      pubkey_path: $pubkey_path,
+      hostname: $hostname,
+      project_id: $project_id,
+      alias_base: $alias_base,
+      controller_id: ($controller_id | select(length>0)),
+      paired_date: $paired_date
+    }')"
+  echo "$json" > "$f"
+  chmod 600 "$f"
+}
+
+load_host_field() {
+  require_jq
+  local host_alias="$1" field="$2"
+  local f; f=$(host_metadata_file "$host_alias")
+  [[ -f "$f" ]] || return 1
+  jq -r --arg field "$field" '.[$field] // empty' "$f"
+}
+
+# ---------- ssh config writing ----------
+
+ssh_config_path() { echo "$HOME/.ssh/config"; }
+
+backup_ssh_config() {
+  local ssh_config; ssh_config="$(ssh_config_path)"
   touch "$ssh_config"
   chmod 600 "$ssh_config"
-  
   local backup="${ssh_config}.bak.$(date +%Y%m%d-%H%M%S)"
   cp "$ssh_config" "$backup"
-  debug "Backed up SSH config to: ${backup}"
-  
-  # Remove existing GWB block
-  local tmpfile
-  tmpfile=$(mktemp)
-  awk '
-    /^Host[[:space:]]+GWB([[:space:]]|$)/ {
-      in_target = 1
+  debug "Backed up SSH config to: $backup"
+}
+
+remove_host_block() {
+  # Remove any "Host <alias>" block (best-effort).
+  local alias="$1"
+  local ssh_config; ssh_config="$(ssh_config_path)"
+  touch "$ssh_config"
+  local tmp; tmp="$(mktemp)"
+
+  awk -v alias="$alias" '
+    BEGIN{in_target=0}
+    /^Host[[:space:]]+/ {
+      in_target = ($0 ~ ("^Host[[:space:]]+" alias "([[:space:]]|$)"))
+      if (!in_target) print
       next
     }
-    /^# Current active controller:/ {
-      in_target = 1
-      next
-    }
-    /^Match[[:space:]]+/ {
-      in_target = 0
-      print
-      next
-    }
-    /^Host[[:space:]]+/ && in_target {
-      in_target = 0
-    }
-    !in_target {
-      print
-    }
-  ' "$ssh_config" > "$tmpfile"
-  mv "$tmpfile" "$ssh_config"
-  
-  # Add new GWB entry
+    /^Match[[:space:]]+/ { in_target=0; print; next }
+    /^[^[:space:]]/ && in_target { in_target=0 }
+    !in_target { print }
+  ' "$ssh_config" > "$tmp"
+  mv "$tmp" "$ssh_config"
+}
+
+upsert_host_entry() {
+  local host_alias="$1" host="$2" user="$3" identity_file="$4" known_hosts_file="$5" comment="${6:-}"
+
+  local ssh_config; ssh_config="$(ssh_config_path)"
+  touch "$ssh_config"
+  chmod 600 "$ssh_config"
+
+  backup_ssh_config
+  remove_host_block "$host_alias"
+
   local host_key_checking="no"
   [[ $STRICT_MODE -eq 1 ]] && host_key_checking="accept-new"
-  
-  cat >> "$ssh_config" <<EOF
 
-# Current active controller: ${alias} (${unique_id})
-Host GWB
-  HostName ${ip}
+  {
+    echo ""
+    [[ -n "$comment" ]] && echo "# ${comment}"
+    cat <<EOF
+Host ${host_alias}
+  HostName ${host}
   User ${user}
   IdentityFile ${identity_file}
   IdentitiesOnly yes
@@ -438,361 +279,329 @@ Host GWB
   UserKnownHostsFile ${known_hosts_file}
   LogLevel ERROR
 EOF
-  
-  # Store current controller reference
-  echo "$alias" > "$CURRENT_CONTROLLER_FILE"
-  chmod 600 "$CURRENT_CONTROLLER_FILE"
-  
-  log "✓ 'GWB' alias now points to: ${alias}"
-  echo ""
-  echo -e "${GREEN}SUCCESS!${NC} Current controller set."
-  echo ""
-  echo "Connect with: ${GREEN}ssh GWB${NC}"
-  echo "Controller: ${hostname} (${ip})"
-  if [[ "$unique_id" != "none" ]]; then
-    echo "Project/Site: ${unique_id}"
-  fi
-  echo ""
-  echo "To switch to a different site, use:"
-  echo "  ./pair-controller.sh --set-current <other-alias>"
+  } >> "$ssh_config"
 }
 
-# Show current active controller
-show_current_controller() {
-  if [[ ! -f "$CURRENT_CONTROLLER_FILE" ]]; then
-    info "No current controller set."
-    echo ""
-    echo "Set one with: ./pair-controller.sh --set-current <alias>"
-    echo "List available controllers: ./pair-controller.sh --list"
-    exit 0
-  fi
-  
-  local current_alias
-  current_alias=$(<"$CURRENT_CONTROLLER_FILE")
-  
-  local metadata_file="${CONTROLLER_DB}/${current_alias}.json"
-  
-  if [[ ! -f "$metadata_file" ]]; then
-    warn "Current controller '${current_alias}' not found in registry (may have been deleted)"
-    echo ""
-    echo "Set a new one with: ./pair-controller.sh --set-current <alias>"
-    exit 1
-  fi
-  
-  echo ""
-  echo -e "${GREEN}Current Active Controller${NC}"
-  echo "========================="
-  
-  if command -v jq >/dev/null 2>&1; then
-    local alias=$(jq -r '.alias' "$metadata_file")
-    local ip=$(jq -r '.ip' "$metadata_file")
-    local user=$(jq -r '.user' "$metadata_file")
-    local hostname=$(jq -r '.hostname // "unknown"' "$metadata_file")
-    local unique_id=$(jq -r '.unique_id // "none"' "$metadata_file")
-    
-    echo ""
-    echo "  Alias:     $alias"
-    echo "  IP:        $ip"
-    echo "  User:      $user"
-    echo "  Hostname:  $hostname"
-    echo "  Unique ID: $unique_id"
-    echo ""
-    echo "  Connect:   ${GREEN}ssh GWB${NC}"
-    echo ""
-  else
-    echo "  ${current_alias}"
-    echo "  (install jq for detailed info)"
-  fi
+remove_current_project_block() {
+  local ssh_config; ssh_config="$(ssh_config_path)"
+  touch "$ssh_config"
+  local tmp; tmp="$(mktemp)"
+  awk -v b="$CURRENT_BLOCK_BEGIN" -v e="$CURRENT_BLOCK_END" '
+    BEGIN{skip=0}
+    $0==b {skip=1; next}
+    $0==e {skip=0; next}
+    skip==0 {print}
+  ' "$ssh_config" > "$tmp"
+  mv "$tmp" "$ssh_config"
 }
 
-# Check for alias collision with different unique_id
-check_alias_collision() {
-  local alias=$1
-  local ip=$2
-  local unique_id=${3:-}
-  local metadata_file="${CONTROLLER_DB}/${alias}.json"
-  
-  if [[ -f "$metadata_file" ]]; then
-    if command -v jq >/dev/null 2>&1; then
-      local existing_ip=$(jq -r '.ip' "$metadata_file")
-      local existing_unique_id=$(jq -r '.unique_id // ""' "$metadata_file")
-      local existing_hostname=$(jq -r '.hostname // "unknown"' "$metadata_file")
-      
-      # Check if this is truly the same controller
-      if [[ "$existing_ip" == "$ip" ]] && [[ "$existing_unique_id" == "$unique_id" ]]; then
-        info "Alias '${alias}' already exists for this IP and unique_id. Will update/re-pair."
-      else
-        warn "Alias '${alias}' already used:"
-        echo "  Existing: IP=${existing_ip}, unique_id='${existing_unique_id}', hostname=${existing_hostname}"
-        echo "  New:      IP=${ip}, unique_id='${unique_id}'"
-        read -p "Continue and overwrite? (y/N) " -n 1 -r
-        echo
-        [[ $REPLY =~ ^[Yy]$ ]] || exit 1
-      fi
-    fi
-  fi
+remove_legacy_gwb_block() {
+  # Best-effort cleanup of older v2/v3 "Host GWB" muscle-memory alias so it doesn't surprise users.
+  local ssh_config; ssh_config="$(ssh_config_path)"
+  touch "$ssh_config"
+  local tmp; tmp="$(mktemp)"
+  awk '
+    BEGIN{in_target=0}
+    /^# Current active controller:/ { in_target=1; next }
+    /^Host[[:space:]]+GWB([[:space:]]|$)/ { in_target=1; next }
+    /^Match[[:space:]]+/ { in_target=0; print; next }
+    /^Host[[:space:]]+/ && in_target { in_target=0; print; next }
+    !in_target { print }
+  ' "$ssh_config" > "$tmp"
+  mv "$tmp" "$ssh_config"
 }
 
-# Helper: run ssh commands with optional sshpass
-run_ssh() {
-  local cmd=("$@")
-  
-  if [[ $DRY_RUN -eq 1 ]]; then
-    echo -e "${BLUE}[DRY-RUN]${NC} Would execute: ${cmd[*]}" >&2
+rebuild_current_project_aliases() {
+  require_jq
+  local project_id="$1"
+  local ssh_config; ssh_config="$(ssh_config_path)"
+  touch "$ssh_config"
+  chmod 600 "$ssh_config"
+
+  backup_ssh_config
+  remove_current_project_block
+  remove_legacy_gwb_block
+
+  {
+    echo ""
+    echo "$CURRENT_BLOCK_BEGIN"
+    echo "# project: $project_id"
+  } >> "$ssh_config"
+
+  # Build one bare Host per alias_base in the current project.
+  # If duplicates exist, first one wins; use --controller to create distinct full aliases.
+  local files=("$REG_DIR"/*.json)
+  if [[ ! -e "${files[0]}" ]]; then
+    # no registry entries
+    echo "$CURRENT_BLOCK_END" >> "$ssh_config"
     return 0
   fi
-  
-  debug "Executing: ${cmd[*]}"
-  
-  # Check for password file first, then environment variable
-  local password_file="${PASSWORD_DIR}/${ALIAS}.pass"
-  
-  if command -v sshpass >/dev/null 2>&1; then
-    if [[ -f "$password_file" ]] && [[ -r "$password_file" ]]; then
-      debug "Using password from file: ${password_file}"
-      sshpass -f "$password_file" "${cmd[@]}"
-    elif [[ -n "${SSH_PASSWORD:-}" ]]; then
-      debug "Using password from SSH_PASSWORD environment variable"
-      sshpass -e "${cmd[@]}"
-    else
-      debug "sshpass available but no password found, running without"
-      "${cmd[@]}"
-    fi
+
+  jq -r --arg p "$project_id" '
+    select(.project_id==$p) |
+    select((.alias_base // "") != "") |
+    [
+      .alias_base,
+      .ip,
+      .user,
+      .pubkey_path,
+      .alias
+    ] | @tsv
+  ' "$REG_DIR"/*.json 2>/dev/null \
+  | awk -F'\t' '!seen[$1]++' \
+  | while IFS=$'\t' read -r abase ip user pubkey_path full_alias; do
+      local identity_file="${pubkey_path%.pub}"
+      local kh_file; kh_file="$(known_hosts_file_for "$full_alias")"
+      local host_key_checking="no"
+      [[ $STRICT_MODE -eq 1 ]] && host_key_checking="accept-new"
+      cat >> "$ssh_config" <<EOF
+Host ${abase}
+  HostName ${ip}
+  User ${user}
+  IdentityFile ${identity_file}
+  IdentitiesOnly yes
+  PreferredAuthentications publickey
+  StrictHostKeyChecking ${host_key_checking}
+  UserKnownHostsFile ${kh_file}
+  LogLevel ERROR
+
+EOF
+    done
+
+  echo "$CURRENT_BLOCK_END" >> "$ssh_config"
+}
+
+# ---------- registry operations ----------
+
+list_controllers() {
+  require_jq
+  local current_project=""
+  [[ -f "$CURRENT_PROJECT_FILE" ]] && current_project="$(<"$CURRENT_PROJECT_FILE")"
+
+  local files=("$REG_DIR"/*.json)
+  if [[ ! -e "${files[0]}" ]]; then
+    info "No controllers registered yet."
+    exit 0
+  fi
+
+  echo ""
+  echo "Registered Controllers"
+  echo "====================="
+  [[ -n "$current_project" ]] && echo "Current project: ${GREEN}${current_project}${NC}" || echo "Current project: (none)"
+  echo ""
+
+  # Group by project (best-effort with jq)
+  jq -s '
+    group_by(.project_id) |
+    map({project_id: .[0].project_id, entries: .})
+  ' "$REG_DIR"/*.json \
+  | jq -r --arg cp "$current_project" '
+    .[] |
+    (
+      "Project " + .project_id +
+      (if .project_id==$cp then "  ★ CURRENT" else "" end) +
+      "\n" +
+      ( .entries
+        | sort_by(.alias_base, .alias)
+        | map(
+            "  - " + .alias +
+            "  (" + .alias_base + " -> " + .ip + " user=" + .user + ")"
+          )
+        | join("\n")
+      ) +
+      "\n"
+    )
+  '
+}
+
+show_controller_info() {
+  require_jq
+  local host_alias="$1"
+  local f; f=$(host_metadata_file "$host_alias")
+  [[ -f "$f" ]] || die "Host alias '${host_alias}' not found."
+  echo ""
+  echo "Host: $host_alias"
+  echo "=============================="
+  jq -r 'to_entries | .[] | "  \(.key): \(.value)"' "$f"
+  echo ""
+  local ip; ip="$(jq -r '.ip' "$f")"
+  echo "Connectivity:"
+  if test_connection "$ip" 22 3; then
+    echo -e "  ${GREEN}✓${NC} ${ip}:22 reachable"
   else
-    if [[ -n "${SSH_PASSWORD:-}" ]]; then
-      warn "SSH_PASSWORD set but sshpass not installed. Install with: sudo apt install sshpass"
+    echo -e "  ${RED}✗${NC} ${ip}:22 NOT reachable"
+  fi
+  echo ""
+}
+
+delete_controller() {
+  require_jq
+  local host_alias="$1"
+  local f; f=$(host_metadata_file "$host_alias")
+  [[ -f "$f" ]] || die "Host alias '${host_alias}' not found."
+
+  local ssh_config; ssh_config="$(ssh_config_path)"
+  backup_ssh_config
+  remove_host_block "$host_alias"
+
+  local kh; kh="$(known_hosts_file_for "$host_alias")"
+  run_cmd rm -f "$f" "$kh"
+
+  # If this alias participates in current project bare hosts, rebuild that block.
+  local current_project=""
+  [[ -f "$CURRENT_PROJECT_FILE" ]] && current_project="$(<"$CURRENT_PROJECT_FILE")"
+  if [[ -n "$current_project" ]]; then
+    rebuild_current_project_aliases "$current_project"
+  fi
+
+  log "Deleted: $host_alias"
+}
+
+# ---------- project operations ----------
+
+set_current_project() {
+  local project_id="$1"
+  [[ -n "$project_id" ]] || die "--set-current-project requires a project id"
+
+  echo "$project_id" > "$CURRENT_PROJECT_FILE"
+  chmod 600 "$CURRENT_PROJECT_FILE"
+
+  rebuild_current_project_aliases "$project_id"
+
+  log "Current project set to: ${project_id}"
+  echo "Now you can use bare aliases, e.g.:"
+  echo "  ssh GWA"
+  echo "  ssh GWB"
+}
+
+show_current_project() {
+  require_jq
+  local project_id=""
+  [[ -f "$CURRENT_PROJECT_FILE" ]] && project_id="$(<"$CURRENT_PROJECT_FILE")"
+  if [[ -z "$project_id" ]]; then
+    echo "No current project set."
+    echo "Set one with: ./pair-controller.sh --set-current-project <project>"
+    return 0
+  fi
+
+  echo "Current project: ${project_id}"
+  echo "Bare aliases available (from this project):"
+  jq -r --arg p "$project_id" '
+    select(.project_id==$p) |
+    .alias_base
+  ' "$REG_DIR"/*.json 2>/dev/null | sort -u | sed 's/^/  - /'
+}
+
+set_current_from_hostalias() {
+  # Deprecated compatibility: --set-current <full_alias>
+  require_jq
+  local host_alias="$1"
+  local f; f=$(host_metadata_file "$host_alias")
+  [[ -f "$f" ]] || die "Host alias '${host_alias}' not found."
+  local project_id; project_id="$(jq -r '.project_id' "$f")"
+  warn "--set-current is deprecated; setting current project to '${project_id}' from host '${host_alias}'."
+  set_current_project "$project_id"
+}
+
+# ---------- pairing logic ----------
+
+generate_host_alias() {
+  local alias_base="$1" project_id="$2" controller_id="${3:-}"
+  local a; a="$(sanitize_token "$alias_base")"
+  local p; p="$(sanitize_token "$project_id")"
+  [[ -n "$controller_id" ]] && echo "${a}-${p}-$(sanitize_token "$controller_id")" || echo "${a}-${p}"
+}
+
+check_alias_collision() {
+  require_jq
+  local host_alias="$1" ip="$2"
+  local f; f=$(host_metadata_file "$host_alias")
+  if [[ -f "$f" ]]; then
+    local existing_ip; existing_ip="$(jq -r '.ip' "$f")"
+    if [[ "$existing_ip" != "$ip" ]]; then
+      die "Alias collision: '${host_alias}' already exists for IP ${existing_ip}. Use --repair ${host_alias} or choose different identifiers."
     fi
-    "${cmd[@]}"
   fi
 }
 
-# Find default public key
-find_default_pubkey() {
-  local default_keys=(
-    "$HOME/.ssh/id_ed25519.pub"
-    "$HOME/.ssh/id_ecdsa.pub"
-    "$HOME/.ssh/id_rsa.pub"
-  )
-  
-  for key in "${default_keys[@]}"; do
-    if [[ -f "$key" ]]; then
-      echo "$key"
-      return 0
-    fi
-  done
-  
-  return 1
-}
-
-# Store metadata as JSON
-store_metadata() {
-  local alias=$1
-  local ip=$2
-  local user=$3
-  local pubkey_path=$4
-  local hostname=$5
-  local unique_id=${6:-}
-  
-  local metadata_file="${CONTROLLER_DB}/${alias}.json"
-  
-  local json_content
-  if [[ -n "$unique_id" ]]; then
-    json_content=$(jq -n \
-      --arg alias "$alias" \
-      --arg ip "$ip" \
-      --arg user "$user" \
-      --arg pubkey "$pubkey_path" \
-      --arg hostname "$hostname" \
-      --arg unique_id "$unique_id" \
-      --arg paired_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      --arg script_version "$SCRIPT_VERSION" \
-      '{
-        alias: $alias,
-        ip: $ip,
-        user: $user,
-        pubkey_path: $pubkey,
-        hostname: $hostname,
-        unique_id: $unique_id,
-        paired_date: $paired_date,
-        script_version: $script_version
-      }')
-  else
-    json_content=$(jq -n \
-      --arg alias "$alias" \
-      --arg ip "$ip" \
-      --arg user "$user" \
-      --arg pubkey "$pubkey_path" \
-      --arg hostname "$hostname" \
-      --arg paired_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      --arg script_version "$SCRIPT_VERSION" \
-      '{
-        alias: $alias,
-        ip: $ip,
-        user: $user,
-        pubkey_path: $pubkey,
-        hostname: $hostname,
-        paired_date: $paired_date,
-        script_version: $script_version
-      }')
-  fi
-  
-  echo "$json_content" > "$metadata_file"
-  chmod 600 "$metadata_file"
-  debug "Stored metadata in: ${metadata_file}"
-}
-
-# Generate alias from IP (now with optional unique_id)
-generate_alias() {
-  local ip=$1
-  local unique_id=${2:-}
-  local base_name="controller"
-  
-  # Extract last octet for simple IPs
-  if validate_ipv4 "$ip"; then
-    local last_octet="${ip##*.}"
-    base_name="controller-${last_octet}"
-  else
-    # For hostnames, sanitize
-    base_name="controller-${ip//[^a-zA-Z0-9-]/-}"
-  fi
-  
-  # Add unique_id if provided
-  if [[ -n "$unique_id" ]]; then
-    # Sanitize unique_id (remove special chars, limit length)
-    local sanitized_id="${unique_id//[^a-zA-Z0-9-]/-}"
-    sanitized_id="${sanitized_id:0:20}"  # Max 20 chars
-    
-    # Insert unique_id between base and IP number
-    if validate_ipv4 "$ip"; then
-      local last_octet="${ip##*.}"
-      echo "${sanitized_id}-${last_octet}"
-    else
-      echo "${sanitized_id}-${base_name}"
-    fi
-  else
-    echo "$base_name"
-  fi
-}
-
-# Main pairing function
 pair_controller() {
-  local ip=$1
-  local user=$2
-  local alias=${3:-}
-  local pubkey_path=${4:-}
-  local unique_id=${5:-}
-  
-  # Auto-generate alias if not provided
-  if [[ -z "$alias" ]]; then
-    alias=$(generate_alias "$ip" "$unique_id")
-    info "Auto-generated alias: ${alias}"
-    debug "Generated alias: ${alias}"
-  fi
-  
-  # Find default pubkey if not provided
+  require_jq
+  local host="$1" user="$2" pubkey_path="${3:-}" project_id="$4" alias_base="$5" controller_id="${6:-}"
+
+  [[ -n "$project_id" ]] || die "--project is required for pairing"
+  [[ -n "$alias_base" ]] || die "--alias is required for pairing (e.g. GWA, GWB, Lift)"
+
+  local host_alias
+  host_alias="$(generate_host_alias "$alias_base" "$project_id" "$controller_id")"
+
   if [[ -z "$pubkey_path" ]]; then
-    if ! pubkey_path=$(find_default_pubkey); then
-      die "No default public key found (~/.ssh/id_ed25519.pub, id_ecdsa.pub, or id_rsa.pub).\nGenerate one with: ssh-keygen -t ed25519"
-    fi
-    debug "Using default public key: ${pubkey_path}"
+    pubkey_path="$(find_default_pubkey)" || die "No default public key found. Generate one with: ssh-keygen -t ed25519"
   fi
-  
-  # Validate inputs
-  [[ -f "$pubkey_path" ]] || die "Public key not found: ${pubkey_path}"
-  
+  [[ -f "$pubkey_path" ]] || die "Public key not found: $pubkey_path"
   local identity_file="${pubkey_path%.pub}"
-  [[ -f "$identity_file" ]] || die "Private key not found (expected: ${identity_file})"
-  
-  # Validate IP format
-  if validate_ipv4 "$ip"; then
-    debug "Valid IPv4 address: ${ip}"
-  else
-    debug "Not IPv4, assuming hostname or IPv6: ${ip}"
-  fi
-  
-  # Check for alias collision
-  check_alias_collision "$alias" "$ip" "$unique_id"
-  
-  # Test network connectivity
-  log "Testing network connectivity to ${ip}:22..."
-  if ! test_connection "$ip" 22 5; then
-    die "Cannot reach ${ip}:22. Check network connectivity and ensure SSH is running."
-  fi
-  log "Connection test successful"
-  
-  # Setup SSH options
-  local known_hosts_file="${KNOWN_HOSTS_DIR}/${alias}"
-  local ssh_target="${user}@${ip}"
-  
+  [[ -f "$identity_file" ]] || die "Private key not found: $identity_file"
+
+  check_alias_collision "$host_alias" "$host"
+
+  log "Testing network connectivity to ${host}:22..."
+  test_connection "$host" 22 5 || die "Cannot reach ${host}:22"
+
+  local known_hosts_file; known_hosts_file="$(known_hosts_file_for "$host_alias")"
+  local ssh_target="${user}@${host}"
+
   local -a ssh_opts_common
   if [[ $STRICT_MODE -eq 1 ]]; then
-    info "Using STRICT mode (StrictHostKeyChecking=accept-new)"
-    ssh_opts_common=(
-      -o StrictHostKeyChecking=accept-new
-      -o UserKnownHostsFile="$known_hosts_file"
-      -o LogLevel=ERROR
-    )
+    info "STRICT mode (StrictHostKeyChecking=accept-new)"
+    ssh_opts_common=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$known_hosts_file" -o LogLevel=ERROR)
   else
-    info "Using PERMISSIVE mode (StrictHostKeyChecking=no) - suitable for dev with same IP, different controllers"
-    ssh_opts_common=(
-      -o StrictHostKeyChecking=no
-      -o UserKnownHostsFile="$known_hosts_file"
-      -o LogLevel=ERROR
-    )
+    info "PERMISSIVE mode (StrictHostKeyChecking=no)"
+    ssh_opts_common=(-o StrictHostKeyChecking=no -o UserKnownHostsFile="$known_hosts_file" -o LogLevel=ERROR)
   fi
-  
-  log "Pairing controller at ${ssh_target}"
-  if [[ -n "$unique_id" ]]; then
-    log "Unique identifier: ${unique_id}"
-  fi
-  log "Using public key: ${pubkey_path}"
-  log "Using private key: ${identity_file}"
-  log "SSH config alias: ${alias}"
-  log "Known hosts file: ${known_hosts_file}"
-  
-  # Pre-flight check: are we already paired?
-  log "Checking if already paired by attempting key-only auth..."
+
+  echo ""
+  log "Pairing: ${ssh_target}"
+  echo "  Project:     $project_id"
+  echo "  Alias base:  $alias_base"
+  [[ -n "$controller_id" ]] && echo "  Controller:  $controller_id"
+  echo "  Host alias:  $host_alias"
+  echo "  Pubkey:      $pubkey_path"
+  echo ""
+
+  # Key-only preflight (skip if repair)
   local already_paired=0
-  
-  # Skip check if this is a forced repair
-  if [[ "${FORCE_REPAIR:-0}" -eq 1 ]]; then
-    info "REPAIR mode: Forcing key reinstallation even if already paired"
-    already_paired=0
-  elif ssh \
-    -i "$identity_file" \
-    -o IdentitiesOnly=yes \
-    -o PreferredAuthentications=publickey \
-    -o PubkeyAuthentication=yes \
-    -o PasswordAuthentication=no \
-    -o BatchMode=yes \
-    -o ConnectTimeout=6 \
-    "${ssh_opts_common[@]}" \
-    "$ssh_target" "true" >/dev/null 2>&1
-  then
-    log "Already paired (key auth works). Skipping key installation."
-    already_paired=1
+  if [[ $FORCE_REPAIR -eq 1 ]]; then
+    info "REPAIR mode: forcing key installation"
   else
-    debug "Key auth failed, will install key"
-    already_paired=0
+    if ssh \
+      -i "$identity_file" \
+      -o IdentitiesOnly=yes \
+      -o PreferredAuthentications=publickey \
+      -o PubkeyAuthentication=yes \
+      -o PasswordAuthentication=no \
+      -o BatchMode=yes \
+      -o ConnectTimeout=6 \
+      "${ssh_opts_common[@]}" \
+      "$ssh_target" "true" >/dev/null 2>&1; then
+      already_paired=1
+      log "Already paired (key auth works)."
+    fi
   fi
-  
-  # Prepare remote ~/.ssh (using password auth)
-  log "Preparing remote ~/.ssh and permissions (password auth)..."
-  run_ssh ssh \
+
+  # Ensure remote ~/.ssh exists (password auth)
+  log "Preparing remote ~/.ssh (password auth)..."
+  run_cmd ssh \
     -o PreferredAuthentications=password \
     -o PubkeyAuthentication=no \
     -o PasswordAuthentication=yes \
+    -o ConnectTimeout=10 \
     "${ssh_opts_common[@]}" \
     "$ssh_target" \
     "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-  
-  # Install key if not already paired
+
   if [[ $already_paired -eq 0 ]]; then
-    log "Installing SSH key on controller..."
-    
+    log "Installing SSH key..."
     if command -v ssh-copy-id >/dev/null 2>&1; then
-      debug "Using ssh-copy-id"
-      run_ssh ssh-copy-id \
+      run_cmd ssh-copy-id \
         -i "$pubkey_path" \
         -o PreferredAuthentications=password \
         -o PubkeyAuthentication=no \
@@ -800,23 +609,22 @@ pair_controller() {
         "${ssh_opts_common[@]}" \
         "$ssh_target"
     else
-      debug "ssh-copy-id not found, using manual method"
       local pubkey_contents
-      pubkey_contents=$(<"$pubkey_path")
-      run_ssh ssh \
+      pubkey_contents="$(<"$pubkey_path")"
+      run_cmd ssh \
         -o PreferredAuthentications=password \
         -o PubkeyAuthentication=no \
         -o PasswordAuthentication=yes \
+        -o ConnectTimeout=10 \
         "${ssh_opts_common[@]}" \
         "$ssh_target" \
         "grep -qxF '$pubkey_contents' ~/.ssh/authorized_keys || echo '$pubkey_contents' >> ~/.ssh/authorized_keys"
     fi
   fi
-  
-  # Get remote hostname for metadata
-  log "Retrieving remote hostname..."
+
+  # Retrieve hostname (best-effort) using key auth
   local remote_hostname="unknown"
-  if remote_hostname=$(ssh \
+  if remote_hostname="$(ssh \
     -i "$identity_file" \
     -o IdentitiesOnly=yes \
     -o PreferredAuthentications=publickey \
@@ -825,214 +633,152 @@ pair_controller() {
     -o BatchMode=yes \
     -o ConnectTimeout=8 \
     "${ssh_opts_common[@]}" \
-    "$ssh_target" "hostname" 2>/dev/null); then
-    debug "Remote hostname: ${remote_hostname}"
+    "$ssh_target" "hostname" 2>/dev/null)"; then
+    remote_hostname="${remote_hostname//$'\r'/}"
   else
-    debug "Could not retrieve hostname, using 'unknown'"
+    remote_hostname="unknown"
   fi
-  
-  # Update SSH config
-  local ssh_config="$HOME/.ssh/config"
-  touch "$ssh_config"
-  chmod 600 "$ssh_config"
-  
-  local backup="${ssh_config}.bak.$(date +%Y%m%d-%H%M%S)"
-  cp "$ssh_config" "$backup"
-  log "Backed up SSH config to: ${backup}"
-  
-  # Remove existing block for this Host alias
-  log "Updating SSH config..."
-  local tmpfile
-  tmpfile=$(mktemp)
-  awk -v alias="$alias" '
-    /^Host[[:space:]]+/ {
-      in_target = ($0 ~ "^Host[[:space:]]+" alias "([[:space:]]|$)")
-      if (!in_target) print
-      next
-    }
-    /^Match[[:space:]]+/ {
-      in_target = 0
-      print
-      next
-    }
-    /^[^[:space:]]/ && in_target {
-      in_target = 0
-    }
-    !in_target {
-      print
-    }
-  ' "$ssh_config" > "$tmpfile"
-  mv "$tmpfile" "$ssh_config"
-  
-  # Add new entry
-  local host_key_checking="no"
-  [[ $STRICT_MODE -eq 1 ]] && host_key_checking="accept-new"
-  
-  # Add comment if unique_id is set
-  if [[ -n "$unique_id" ]]; then
-    cat >> "$ssh_config" <<EOF
 
-# Controller: ${unique_id} (${ip})
-Host ${alias}
-  HostName ${ip}
-  User ${user}
-  IdentityFile ${identity_file}
-  IdentitiesOnly yes
-  PreferredAuthentications publickey
-  StrictHostKeyChecking ${host_key_checking}
-  UserKnownHostsFile ${known_hosts_file}
-  LogLevel ERROR
-EOF
-  else
-    cat >> "$ssh_config" <<EOF
+  # Upsert SSH host entry for the stable alias
+  local comment="Project: ${project_id} (alias ${alias_base}${controller_id:+/${controller_id}}) (${host})"
+  upsert_host_entry "$host_alias" "$host" "$user" "$identity_file" "$known_hosts_file" "$comment"
+  log "SSH config updated: Host ${host_alias}"
 
-Host ${alias}
-  HostName ${ip}
-  User ${user}
-  IdentityFile ${identity_file}
-  IdentitiesOnly yes
-  PreferredAuthentications publickey
-  StrictHostKeyChecking ${host_key_checking}
-  UserKnownHostsFile ${known_hosts_file}
-  LogLevel ERROR
-EOF
-  fi
-  
-  log "Added/updated SSH config entry: Host ${alias}"
-  
   # Store metadata
-  store_metadata "$alias" "$ip" "$user" "$pubkey_path" "$remote_hostname" "$unique_id"
-  log "Stored controller metadata"
-  
-  # Verify key auth works
-  log "Testing key-only login via alias..."
-  if ssh \
-    -o BatchMode=yes \
-    -o ConnectTimeout=8 \
-    "$alias" "echo 'Key auth verified on' \"\$(hostname)\"" >/dev/null 2>&1
-  then
-    log "✓ Key auth verified successfully!"
-    echo ""
-    echo -e "${GREEN}SUCCESS!${NC} Controller paired successfully."
-    echo ""
-    echo "Connect with: ${GREEN}ssh ${alias}${NC}"
-    if [[ -n "$unique_id" ]]; then
-      echo "Unique ID: ${unique_id}"
-    fi
-    echo "Controller: ${remote_hostname} (${ip})"
-    echo ""
-  else
-    warn "Key-auth test failed."
-    echo ""
-    echo "Try manual connection with verbose output:"
-    echo "  ssh -vvv ${alias}"
-    echo ""
-    echo "Or test directly:"
-    echo "  ssh -vvv -i '${identity_file}' -o IdentitiesOnly=yes ${ssh_opts_common[*]} ${ssh_target}"
-    exit 1
+  store_host_metadata "$host_alias" "$host" "$user" "$pubkey_path" "$remote_hostname" "$project_id" "$alias_base" "${controller_id:-}"
+  log "Registered: ${host_alias}"
+
+  # If current project matches, refresh bare aliases
+  local current_project=""
+  [[ -f "$CURRENT_PROJECT_FILE" ]] && current_project="$(<"$CURRENT_PROJECT_FILE")"
+  if [[ -n "$current_project" && "$current_project" == "$project_id" ]]; then
+    rebuild_current_project_aliases "$project_id"
+    log "Refreshed bare aliases for current project: $project_id"
   fi
+
+  echo ""
+  echo -e "Connect now:"
+  echo -e "  ${GREEN}ssh ${host_alias}${NC}"
+  if [[ -f "$CURRENT_PROJECT_FILE" && "$(<"$CURRENT_PROJECT_FILE")" == "$project_id" ]]; then
+    echo -e "  ${GREEN}ssh ${alias_base}${NC}  (because current project is ${project_id})"
+  fi
+  echo ""
 }
 
-# Parse command line arguments
-parse_args() {
-  local -a positional_args=()
-  local unique_id=""
-  
-  while [[ $# -gt 0 ]]; do
-    case $1 in
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      -v|--verbose)
-        VERBOSE=1
-        shift
-        ;;
-      -n|--dry-run)
-        DRY_RUN=1
-        shift
-        ;;
-      -s|--strict)
-        STRICT_MODE=1
-        shift
-        ;;
-      -r|--repair)
-        [[ -z "${2:-}" ]] && die "Option --repair requires an alias argument"
-        repair_controller "$2"
-        exit 0
-        ;;
-      -u|--unique-id)
-        [[ -z "${2:-}" ]] && die "Option --unique-id requires an argument"
-        unique_id="$2"
-        shift 2
-        ;;
-      -l|--list)
-        list_controllers
-        exit 0
-        ;;
-      -d|--delete)
-        [[ -z "${2:-}" ]] && die "Option --delete requires an alias argument"
-        delete_controller "$2"
-        exit 0
-        ;;
-      -i|--info)
-        [[ -z "${2:-}" ]] && die "Option --info requires an alias argument"
-        show_controller_info "$2"
-        exit 0
-        ;;
-      -c|--set-current)
-        [[ -z "${2:-}" ]] && die "Option --set-current requires an alias argument"
-        set_current_controller "$2"
-        exit 0
-        ;;
-      --show-current)
-        show_current_controller
-        exit 0
-        ;;
-      -*)
-        die "Unknown option: $1\nUse --help for usage information"
-        ;;
-      *)
-        positional_args+=("$1")
-        shift
-        ;;
-    esac
-  done
-  
-  # Restore positional arguments
-  set -- "${positional_args[@]}"
-  
-  # Export for use in main
-  export PARSED_IP="${1:-}"
-  export PARSED_USER="${2:-}"
-  export PARSED_ALIAS="${3:-}"
-  export PARSED_PUBKEY="${4:-}"
-  export PARSED_UNIQUE_ID="$unique_id"
+repair_controller() {
+  require_jq
+  local host_alias="$1"
+  local f; f=$(host_metadata_file "$host_alias")
+  [[ -f "$f" ]] || die "Host alias '${host_alias}' not found."
+
+  local host user pubkey_path project_id alias_base controller_id
+  host="$(jq -r '.ip' "$f")"
+  user="$(jq -r '.user' "$f")"
+  pubkey_path="$(jq -r '.pubkey_path' "$f")"
+  project_id="$(jq -r '.project_id' "$f")"
+  alias_base="$(jq -r '.alias_base' "$f")"
+  controller_id="$(jq -r '.controller_id // empty' "$f")"
+
+  FORCE_REPAIR=1
+  info "Repairing: ${host_alias} (reinstall key + rewrite ssh config entry)"
+  pair_controller "$host" "$user" "$pubkey_path" "$project_id" "$alias_base" "${controller_id:-}"
 }
 
-# Main entry point
-main() {
-  # Setup
-  setup_directories
-  
-  # Parse arguments
-  parse_args "$@"
-  
-  # Validate required arguments
-  if [[ -z "$PARSED_IP" || -z "$PARSED_USER" ]]; then
-    usage
-    exit 1
-  fi
-  
-  # Set alias global for run_ssh function
-  ALIAS="$PARSED_ALIAS"
-  if [[ -z "$ALIAS" ]]; then
-    ALIAS=$(generate_alias "$PARSED_IP" "$PARSED_UNIQUE_ID")
-  fi
-  
-  # Execute pairing
-  pair_controller "$PARSED_IP" "$PARSED_USER" "$PARSED_ALIAS" "$PARSED_PUBKEY" "$PARSED_UNIQUE_ID"
-}
+# ---------- argument parsing ----------
 
-# Run main
-main "$@"
+ACTION="pair"
+LIST=0
+SHOW_INFO=""
+DELETE_ALIAS=""
+REPAIR_ALIAS=""
+SET_CURRENT_PROJECT=""
+SHOW_CURRENT_PROJECT=0
+COMPAT_SET_CURRENT=""
+
+PROJECT_ID=""
+ALIAS_BASE=""
+CONTROLLER_ID=""
+COMPAT_UNIQUE_ID=""
+
+POSITIONALS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    -s|--strict) STRICT_MODE=1; shift ;;
+
+    -p|--project) PROJECT_ID="${2:-}"; shift 2 ;;
+    --unique-id) COMPAT_UNIQUE_ID="${2:-}"; shift 2 ;;
+    -a|--alias) ALIAS_BASE="${2:-}"; shift 2 ;;
+    --controller) CONTROLLER_ID="${2:-}"; shift 2 ;;
+
+    -l|--list) LIST=1; ACTION="list"; shift ;;
+    -i|--info) SHOW_INFO="${2:-}"; ACTION="info"; shift 2 ;;
+    -d|--delete) DELETE_ALIAS="${2:-}"; ACTION="delete"; shift 2 ;;
+    -r|--repair) REPAIR_ALIAS="${2:-}"; ACTION="repair"; shift 2 ;;
+
+    --set-current-project) SET_CURRENT_PROJECT="${2:-}"; ACTION="set-current-project"; shift 2 ;;
+    --show-current-project) SHOW_CURRENT_PROJECT=1; ACTION="show-current-project"; shift ;;
+
+    --set-current) COMPAT_SET_CURRENT="${2:-}"; ACTION="compat-set-current"; shift 2 ;;
+
+    --) shift; break ;;
+    -*)
+      die "Unknown option: $1"
+      ;;
+    *)
+      POSITIONALS+=("$1"); shift ;;
+  esac
+done
+
+# Append remaining args (after --)
+while [[ $# -gt 0 ]]; do POSITIONALS+=("$1"); shift; done
+
+setup_directories
+
+# Compatibility: unique-id -> project
+if [[ -n "$COMPAT_UNIQUE_ID" && -z "$PROJECT_ID" ]]; then
+  warn "--unique-id is deprecated; treating as --project."
+  PROJECT_ID="$COMPAT_UNIQUE_ID"
+fi
+
+case "$ACTION" in
+  list)
+    list_controllers
+    ;;
+  info)
+    [[ -n "$SHOW_INFO" ]] || die "--info requires a host alias"
+    show_controller_info "$SHOW_INFO"
+    ;;
+  delete)
+    [[ -n "$DELETE_ALIAS" ]] || die "--delete requires a host alias"
+    delete_controller "$DELETE_ALIAS"
+    ;;
+  repair)
+    [[ -n "$REPAIR_ALIAS" ]] || die "--repair requires a host alias"
+    repair_controller "$REPAIR_ALIAS"
+    ;;
+  set-current-project)
+    set_current_project "$SET_CURRENT_PROJECT"
+    ;;
+  show-current-project)
+    show_current_project
+    ;;
+  compat-set-current)
+    [[ -n "$COMPAT_SET_CURRENT" ]] || die "--set-current requires a host alias"
+    set_current_from_hostalias "$COMPAT_SET_CURRENT"
+    ;;
+  pair)
+    # Expect: <host> <user> [pubkey]
+    [[ ${#POSITIONALS[@]} -ge 2 ]] || { usage; exit 1; }
+    host="${POSITIONALS[0]}"
+    user="${POSITIONALS[1]}"
+    pubkey="${POSITIONALS[2]:-}"
+    pair_controller "$host" "$user" "$pubkey" "$PROJECT_ID" "$ALIAS_BASE" "$CONTROLLER_ID"
+    ;;
+  *)
+    die "Internal error: unknown action '$ACTION'"
+    ;;
+esac
