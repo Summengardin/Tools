@@ -557,166 +557,99 @@ pair_controller() {
   local host="$1" user="$2" pubkey_path="${3:-}" project_id="$4" alias_base="$5" controller_id="${6:-}"
 
   [[ -n "$project_id" ]] || die "--project is required for pairing"
-  [[ -n "$alias_base" ]] || die "--alias is required for pairing (e.g. GWA, GWB, Lift)"
+  [[ -n "$alias_base" ]] || die "--alias is required for pairing"
 
   local host_alias
   host_alias="$(generate_host_alias "$alias_base" "$project_id" "$controller_id")"
 
   if [[ -z "$pubkey_path" ]]; then
-    pubkey_path="$(find_default_pubkey)" || die "No default public key found. Generate one with: ssh-keygen -t ed25519"
+    pubkey_path="$(find_default_pubkey)" || die "No default public key found"
   fi
+
   [[ -f "$pubkey_path" ]] || die "Public key not found: $pubkey_path"
   local identity_file="${pubkey_path%.pub}"
   [[ -f "$identity_file" ]] || die "Private key not found: $identity_file"
 
   check_alias_collision "$host_alias" "$host"
 
-  log "Testing network connectivity to ${host}:22..."
+  log "Testing connectivity to ${host}:22..."
   test_connection "$host" 22 5 || die "Cannot reach ${host}:22"
 
   local known_hosts_file; known_hosts_file="$(known_hosts_file_for "$host_alias")"
   local ssh_target="${user}@${host}"
 
-  local -a ssh_opts_common
-  if [[ $STRICT_MODE -eq 1 ]]; then
-    info "STRICT mode (StrictHostKeyChecking=accept-new)"
-    ssh_opts_common=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$known_hosts_file" -o LogLevel=ERROR)
-  else
-    info "PERMISSIVE mode (StrictHostKeyChecking=no)"
-    ssh_opts_common=(-o StrictHostKeyChecking=no -o UserKnownHostsFile="$known_hosts_file" -o LogLevel=ERROR)
-  fi
+  local host_key_checking="no"
+  [[ $STRICT_MODE -eq 1 ]] && host_key_checking="accept-new"
 
-  echo ""
-  log "Pairing: ${ssh_target}"
-  echo "  Project:     $project_id"
-  echo "  Alias base:  $alias_base"
-  [[ -n "$controller_id" ]] && echo "  Controller:  $controller_id"
-  echo "  Host alias:  $host_alias"
-  echo "  Pubkey:      $pubkey_path"
-  echo ""
-
-  # Key-only preflight (skip if repair)
-  local already_paired=0
-  if [[ $FORCE_REPAIR -eq 1 ]]; then
-    info "REPAIR mode: forcing key installation"
-  else
-    if ssh \
-      -i "$identity_file" \
-      -o IdentitiesOnly=yes \
-      -o PreferredAuthentications=publickey \
-      -o PubkeyAuthentication=yes \
-      -o PasswordAuthentication=no \
-      -o BatchMode=yes \
-      -o ConnectTimeout=6 \
-      "${ssh_opts_common[@]}" \
-      "$ssh_target" "true" >/dev/null 2>&1; then
-      already_paired=1
-      log "Already paired (key auth works)."
-    fi
-  fi
-
-  # Ensure remote ~/.ssh exists (password auth)
-  log "Preparing remote ~/.ssh (password auth)..."
-  run_cmd ssh \
-    -o PreferredAuthentications=password \
-    -o PubkeyAuthentication=no \
-    -o PasswordAuthentication=yes \
-    -o ConnectTimeout=10 \
-    "${ssh_opts_common[@]}" \
-    "$ssh_target" \
-    "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-
-  if [[ $already_paired -eq 0 ]]; then
-    log "Removing stale SSH host key (if any)..."
-    remove_stale_hostkey "$ip"
-    log "Installing SSH key..."
-    if command -v ssh-copy-id >/dev/null 2>&1; then
-      if [[ -n "$PASSWORD" || $ASK_PASSWORD -eq 1 ]]; then
-        ensure_password "$ssh_target"
-        run_cmd env SSHPASS="$PASSWORD" sshpass -e ssh-copy-id \
-          -i "$pubkey_path" \
-          -o PreferredAuthentications=password \
-          -o PubkeyAuthentication=no \
-          -o PasswordAuthentication=yes \
-          "${ssh_opts_common[@]}" \
-          "$ssh_target"
-      else
-        run_cmd ssh-copy-id \
-          -i "$pubkey_path" \
-          -o PreferredAuthentications=password \
-          -o PubkeyAuthentication=no \
-          -o PasswordAuthentication=yes \
-          "${ssh_opts_common[@]}" \
-          "$ssh_target"
-      fi
-    else
-      local pubkey_contents
-      pubkey_contents="$(<"$pubkey_path")"
-      if [[ -n "$PASSWORD" || $ASK_PASSWORD -eq 1 ]]; then
-        ensure_password "$ssh_target"
-        run_cmd env SSHPASS="$PASSWORD" sshpass -e ssh \
-          -o PreferredAuthentications=password \
-          -o PubkeyAuthentication=no \
-          -o PasswordAuthentication=yes \
-          -o ConnectTimeout=10 \
-          "${ssh_opts_common[@]}" \
-          "$ssh_target" \
-          "grep -qxF '$pubkey_contents' ~/.ssh/authorized_keys || echo '$pubkey_contents' >> ~/.ssh/authorized_keys"
-      else
-        run_cmd ssh \
-          -o PreferredAuthentications=password \
-          -o PubkeyAuthentication=no \
-          -o PasswordAuthentication=yes \
-          -o ConnectTimeout=10 \
-          "${ssh_opts_common[@]}" \
-          "$ssh_target" \
-          "grep -qxF '$pubkey_contents' ~/.ssh/authorized_keys || echo '$pubkey_contents' >> ~/.ssh/authorized_keys"
-      fi
-    fi
-  fi
-
-  # Retrieve hostname (best-effort) using key auth
-  local remote_hostname="unknown"
-  if remote_hostname="$(ssh \
+  # ------------------------------------------------------------------
+  # STEP 1: Check if already paired (key-only, ZERO password attempts)
+  # ------------------------------------------------------------------
+  if ssh \
     -i "$identity_file" \
     -o IdentitiesOnly=yes \
     -o PreferredAuthentications=publickey \
     -o PubkeyAuthentication=yes \
     -o PasswordAuthentication=no \
     -o BatchMode=yes \
-    -o ConnectTimeout=8 \
-    "${ssh_opts_common[@]}" \
-    "$ssh_target" "hostname" 2>/dev/null)"; then
-    remote_hostname="${remote_hostname//$'\r'/}"
+    -o StrictHostKeyChecking="$host_key_checking" \
+    -o UserKnownHostsFile="$known_hosts_file" \
+    -o ConnectTimeout=5 \
+    "$ssh_target" "true" >/dev/null 2>&1; then
+
+    log "Already paired (key auth works)."
   else
-    remote_hostname="unknown"
+    # ------------------------------------------------------------------
+    # STEP 2: SINGLE password-auth session
+    # ------------------------------------------------------------------
+    log "Installing SSH key (single password-auth session)..."
+
+    ensure_password "$ssh_target"
+
+    local pubkey_contents
+    pubkey_contents="$(<"$pubkey_path")"
+
+    run_cmd env SSHPASS="$PASSWORD" sshpass -e ssh \
+      -o IdentitiesOnly=yes \
+      -o PreferredAuthentications=password \
+      -o PubkeyAuthentication=no \
+      -o PasswordAuthentication=yes \
+      -o StrictHostKeyChecking="$host_key_checking" \
+      -o UserKnownHostsFile="$known_hosts_file" \
+      -o ConnectTimeout=8 \
+      "$ssh_target" \
+      "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
+       touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && \
+       grep -qxF '$pubkey_contents' ~/.ssh/authorized_keys || \
+       echo '$pubkey_contents' >> ~/.ssh/authorized_keys"
   fi
 
-  # Upsert SSH host entry for the stable alias
-  local comment="Project: ${project_id} (alias ${alias_base}${controller_id:+/${controller_id}}) (${host})"
+  # ------------------------------------------------------------------
+  # STEP 3: Verify key-only login (NO password fallback allowed)
+  # ------------------------------------------------------------------
+  ssh \
+    -i "$identity_file" \
+    -o IdentitiesOnly=yes \
+    -o PreferredAuthentications=publickey \
+    -o PubkeyAuthentication=yes \
+    -o PasswordAuthentication=no \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking="$host_key_checking" \
+    -o UserKnownHostsFile="$known_hosts_file" \
+    -o ConnectTimeout=5 \
+    "$ssh_target" "true" >/dev/null 2>&1 \
+    || die "Key installation failed (verification failed)."
+
+  # ------------------------------------------------------------------
+  # STEP 4: Write SSH config
+  # ------------------------------------------------------------------
+  local comment="Project: ${project_id} (${alias_base}${controller_id:+/${controller_id}})"
   upsert_host_entry "$host_alias" "$host" "$user" "$identity_file" "$known_hosts_file" "$comment"
-  log "SSH config updated: Host ${host_alias}"
 
-  # Store metadata
-  store_host_metadata "$host_alias" "$host" "$user" "$pubkey_path" "$remote_hostname" "$project_id" "$alias_base" "${controller_id:-}"
-  log "Registered: ${host_alias}"
+  store_host_metadata "$host_alias" "$host" "$user" "$pubkey_path" "unknown" "$project_id" "$alias_base" "${controller_id:-}"
 
-  # If current project matches, refresh bare aliases
-  local current_project=""
-  [[ -f "$CURRENT_PROJECT_FILE" ]] && current_project="$(<"$CURRENT_PROJECT_FILE")"
-  if [[ -n "$current_project" && "$current_project" == "$project_id" ]]; then
-    rebuild_current_project_aliases "$project_id"
-    log "Refreshed bare aliases for current project: $project_id"
-  fi
-
-  echo ""
-  echo -e "Connect now:"
-  echo -e "  ${GREEN}ssh ${host_alias}${NC}"
-  if [[ -f "$CURRENT_PROJECT_FILE" && "$(<"$CURRENT_PROJECT_FILE")" == "$project_id" ]]; then
-    echo -e "  ${GREEN}ssh ${alias_base}${NC}  (because current project is ${project_id})"
-  fi
-  echo ""
+  log "Paired successfully: ${host_alias}"
 }
+
 
 repair_controller() {
   require_jq
