@@ -1,3 +1,12 @@
+# Ensure remote ~/.ssh exists (password auth bootstrap)
+log "Preparing remote ~/.ssh (password auth)..."
+if [[ -n "$PASSWORD" || $ASK_PASSWORD -eq 1 ]]; then
+  ensure_password "$ssh_target"
+  run_cmd env SSHPASS="$PASSWORD" sshpass -e ssh       -o PreferredAuthentications=password       -o PubkeyAuthentication=no       -o PasswordAuthentication=yes       -o ConnectTimeout=10       "${ssh_opts_common[@]}"       "$ssh_target"       "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+else
+  run_cmd ssh       -o PreferredAuthentications=password       -o PubkeyAuthentication=no       -o PasswordAuthentication=yes       -o ConnectTimeout=10       "${ssh_opts_common[@]}"       "$ssh_target"       "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+fi
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -18,7 +27,7 @@ set -euo pipefail
 #   - writes SSH config host entries,
 #   - manages a "CURRENT-PROJECT" block in ~/.ssh/config that rewrites bare aliases.
 
-SCRIPT_VERSION="4.0"
+SCRIPT_VERSION="4.1"
 
 # Storage
 REG_DIR="$HOME/.ssh/controller_registry"
@@ -35,6 +44,8 @@ VERBOSE=0
 DRY_RUN=0
 STRICT_MODE=0
 FORCE_REPAIR=0
+ASK_PASSWORD=0
+PASSWORD=""
 
 # Colors
 RED='\033[0;31m'
@@ -84,6 +95,8 @@ Identity:
   -p, --project PROJECT            Project identifier (required for pairing)
   -a, --alias ALIAS                Controller alias base (required for pairing, e.g. GWA, GWB, Lift)
   --controller ID                  Optional controller identifier (only for duplicates, e.g. spare)
+  --ask-password                   Prompt for controller password (safer than --password)
+  --password PASSWORD              Provide password via CLI (insecure; avoid if possible)
 
 Registry:
   -l, --list                       List registered controllers
@@ -119,6 +132,19 @@ run_cmd() {
     return 0
   fi
   "$@"
+}
+
+ensure_password() {
+  # Only used for initial password-auth bootstrap (mkdir ~/.ssh, ssh-copy-id).
+  # --ask-password prompts securely; --password is supported but insecure.
+  local target_hint="${1:-controller}"
+  if [[ $ASK_PASSWORD -eq 1 && -z "$PASSWORD" ]]; then
+    read -rsp "Password for ${target_hint}: " PASSWORD
+    echo ""
+  fi
+  if [[ -n "$PASSWORD" ]]; then
+    command -v sshpass >/dev/null 2>&1 || die "sshpass is required when using --ask-password/--password. Install with: sudo apt install sshpass"
+  fi
 }
 
 # Validate IPv4 address (best-effort; hostnames/IPv6 are allowed)
@@ -601,24 +627,47 @@ pair_controller() {
   if [[ $already_paired -eq 0 ]]; then
     log "Installing SSH key..."
     if command -v ssh-copy-id >/dev/null 2>&1; then
-      run_cmd ssh-copy-id \
-        -i "$pubkey_path" \
-        -o PreferredAuthentications=password \
-        -o PubkeyAuthentication=no \
-        -o PasswordAuthentication=yes \
-        "${ssh_opts_common[@]}" \
-        "$ssh_target"
+      if [[ -n "$PASSWORD" || $ASK_PASSWORD -eq 1 ]]; then
+        ensure_password "$ssh_target"
+        run_cmd env SSHPASS="$PASSWORD" sshpass -e ssh-copy-id \
+          -i "$pubkey_path" \
+          -o PreferredAuthentications=password \
+          -o PubkeyAuthentication=no \
+          -o PasswordAuthentication=yes \
+          "${ssh_opts_common[@]}" \
+          "$ssh_target"
+      else
+        run_cmd ssh-copy-id \
+          -i "$pubkey_path" \
+          -o PreferredAuthentications=password \
+          -o PubkeyAuthentication=no \
+          -o PasswordAuthentication=yes \
+          "${ssh_opts_common[@]}" \
+          "$ssh_target"
+      fi
     else
       local pubkey_contents
       pubkey_contents="$(<"$pubkey_path")"
-      run_cmd ssh \
-        -o PreferredAuthentications=password \
-        -o PubkeyAuthentication=no \
-        -o PasswordAuthentication=yes \
-        -o ConnectTimeout=10 \
-        "${ssh_opts_common[@]}" \
-        "$ssh_target" \
-        "grep -qxF '$pubkey_contents' ~/.ssh/authorized_keys || echo '$pubkey_contents' >> ~/.ssh/authorized_keys"
+      if [[ -n "$PASSWORD" || $ASK_PASSWORD -eq 1 ]]; then
+        ensure_password "$ssh_target"
+        run_cmd env SSHPASS="$PASSWORD" sshpass -e ssh \
+          -o PreferredAuthentications=password \
+          -o PubkeyAuthentication=no \
+          -o PasswordAuthentication=yes \
+          -o ConnectTimeout=10 \
+          "${ssh_opts_common[@]}" \
+          "$ssh_target" \
+          "grep -qxF '$pubkey_contents' ~/.ssh/authorized_keys || echo '$pubkey_contents' >> ~/.ssh/authorized_keys"
+      else
+        run_cmd ssh \
+          -o PreferredAuthentications=password \
+          -o PubkeyAuthentication=no \
+          -o PasswordAuthentication=yes \
+          -o ConnectTimeout=10 \
+          "${ssh_opts_common[@]}" \
+          "$ssh_target" \
+          "grep -qxF '$pubkey_contents' ~/.ssh/authorized_keys || echo '$pubkey_contents' >> ~/.ssh/authorized_keys"
+      fi
     fi
   fi
 
@@ -713,6 +762,9 @@ while [[ $# -gt 0 ]]; do
     --unique-id) COMPAT_UNIQUE_ID="${2:-}"; shift 2 ;;
     -a|--alias) ALIAS_BASE="${2:-}"; shift 2 ;;
     --controller) CONTROLLER_ID="${2:-}"; shift 2 ;;
+
+    --ask-password) ASK_PASSWORD=1; shift ;;
+    --password) PASSWORD="${2:-}"; warn "--password is insecure (shell history/process list). Prefer --ask-password."; shift 2 ;;
 
     -l|--list) LIST=1; ACTION="list"; shift ;;
     -i|--info) SHOW_INFO="${2:-}"; ACTION="info"; shift 2 ;;
